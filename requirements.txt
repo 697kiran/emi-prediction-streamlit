@@ -5,7 +5,6 @@ numpy>=1.25.0
 scikit-learn
 xgboost
 plotly
-mlflow==2.5.0
 joblib
 seaborn==0.12.2
 matplotlib
