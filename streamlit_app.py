@@ -1,4 +1,4 @@
-# streamlit_app.py (updated)
+# streamlit_app.py (resolved & updated)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -298,7 +298,7 @@ elif page == "EMI Prediction":
         submitted = st.form_submit_button("Predict EMI Eligibility & Amount", use_container_width=True)
 
         if submitted:
-            # Feature engineering (same formulae used in training)
+            # ---------- compute derived numeric features ----------
             debt_to_income_ratio = safe_div(current_emi_amount, monthly_salary)
             total_expenses = monthly_rent + school_fees + college_fees + travel_expenses + groceries_utilities + other_monthly_expenses
             expense_to_income_ratio = safe_div(total_expenses, monthly_salary)
@@ -308,89 +308,158 @@ elif page == "EMI Prediction":
             credit_utilization = safe_div(current_emi_amount, max(1.0, credit_score / 100.0))
             dependency_ratio = safe_div(dependents, family_size)
 
-            # Build simplified input dictionary (base numeric features + encoded binaries)
-            input_data = pd.DataFrame(
-                {
-                    "age": [age],
-                    "monthly_salary": [monthly_salary],
-                    "years_of_employment": [years_of_employment],
-                    "monthly_rent": [monthly_rent],
-                    "family_size": [family_size],
-                    "dependents": [dependents],
-                    "school_fees": [school_fees],
-                    "college_fees": [college_fees],
-                    "travel_expenses": [travel_expenses],
-                    "groceries_utilities": [groceries_utilities],
-                    "other_monthly_expenses": [other_monthly_expenses],
-                    "current_emi_amount": [current_emi_amount],
-                    "credit_score": [credit_score],
-                    "bank_balance": [bank_balance],
-                    "emergency_fund": [emergency_fund],
-                    "requested_amount": [requested_amount],
-                    "requested_tenure": [requested_tenure],
-                    "debt_to_income_ratio": [debt_to_income_ratio],
-                    "expense_to_income_ratio": [expense_to_income_ratio],
-                    "affordability_ratio": [affordability_ratio],
-                    "employment_stability_score": [employment_stability_score],
-                    "financial_stability_score": [financial_stability_score],
-                    "credit_utilization": [credit_utilization],
-                    "dependency_ratio": [dependency_ratio],
-                    # simple binary encodings (train-time encodings should be applied similarly)
-                    "gender_encoded": [1 if gender == "Male" else 0],
-                    "marital_status_encoded": [1 if marital_status == "Married" else 0],
-                    "existing_loans_encoded": [1 if existing_loans == "Yes" else 0],
-                }
-            )
+            # ---------- compute categorical buckets used in training ----------
+            if age <= 30:
+                age_group_val = "Young"
+            elif age <= 40:
+                age_group_val = "Adult"
+            elif age <= 50:
+                age_group_val = "Middle_Age"
+            else:
+                age_group_val = "Senior"
 
-            # Convert to final vector that matches training features
-            input_vector = build_feature_vector(input_data, feature_columns)
+            if monthly_salary <= 30000:
+                income_cat_val = "Low"
+            elif monthly_salary <= 60000:
+                income_cat_val = "Medium"
+            elif monthly_salary <= 100000:
+                income_cat_val = "High"
+            else:
+                income_cat_val = "Premium"
 
+            # ---------- base numeric + binary features ----------
+            base_dict = {
+                "age": age,
+                "monthly_salary": monthly_salary,
+                "years_of_employment": years_of_employment,
+                "monthly_rent": monthly_rent,
+                "family_size": family_size,
+                "dependents": dependents,
+                "school_fees": school_fees,
+                "college_fees": college_fees,
+                "travel_expenses": travel_expenses,
+                "groceries_utilities": groceries_utilities,
+                "other_monthly_expenses": other_monthly_expenses,
+                "current_emi_amount": current_emi_amount,
+                "credit_score": credit_score,
+                "bank_balance": bank_balance,
+                "emergency_fund": emergency_fund,
+                "requested_amount": requested_amount,
+                "requested_tenure": requested_tenure,
+                "debt_to_income_ratio": debt_to_income_ratio,
+                "expense_to_income_ratio": expense_to_income_ratio,
+                "affordability_ratio": affordability_ratio,
+                "employment_stability_score": employment_stability_score,
+                "financial_stability_score": financial_stability_score,
+                "credit_utilization": credit_utilization,
+                "dependency_ratio": dependency_ratio,
+                "gender_encoded": 1 if gender == "Male" else 0,
+                "marital_status_encoded": 1 if marital_status == "Married" else 0,
+                "existing_loans_encoded": 1 if existing_loans == "Yes" else 0,
+            }
+
+            # ---------- helper: set one-hot columns using feature_columns ----------
+            def apply_one_hot(base_row_dict, feature_columns, mappings):
+                """
+                base_row_dict: numeric + binary values (dict)
+                feature_columns: list of training feature names (ordered)
+                mappings: dict of {prefix: value} e.g. {"education": "Graduate", "employment_type": "Private"}
+                Returns a 1-row DataFrame with exactly feature_columns columns.
+                """
+                fv = pd.DataFrame(columns=feature_columns)
+                fv.loc[0] = 0
+                # fill numeric/binary values that are present in feature_columns
+                for k, v in base_row_dict.items():
+                    if k in fv.columns:
+                        try:
+                            fv.at[0, k] = float(v)
+                        except Exception:
+                            fv.at[0, k] = v
+                # For each mapping, set the matching one-hot column to 1 if it exists
+                for prefix, val in mappings.items():
+                    candidates = [
+                        f"{prefix}_{val}",
+                        f"{prefix}_{val.replace(' ', '_')}",
+                        f"{prefix}_{val.replace('-', '_')}",
+                        f"{prefix}_{val.replace(' ', '')}",
+                    ]
+                    candidates += [f"{prefix}_Unknown", f"{prefix}_nan", f"{prefix}_NA"]
+                    found = False
+                    for c in candidates:
+                        if c in fv.columns:
+                            fv.at[0, c] = 1
+                            found = True
+                            break
+                    if not found:
+                        for col in feature_columns:
+                            if col.startswith(prefix + "_") and val.lower() in col.lower():
+                                fv.at[0, col] = 1
+                                found = True
+                                break
+                fv = fv.apply(pd.to_numeric, errors="coerce").fillna(0)
+                return fv
+
+            cat_mappings = {
+                "education": education,
+                "employment_type": employment_type,
+                "company_type": company_type,
+                "house_type": house_type,
+                "emi_scenario": emi_scenario,
+                "age_group": age_group_val,
+                "income_category": income_cat_val,
+            }
+
+            # build the final input vector DataFrame (exactly match feature_columns)
             try:
-                # Scale (if scaler present)
+                input_vector = apply_one_hot(base_dict, feature_columns, cat_mappings)
+            except Exception as e:
+                st.error(f"Error building feature vector: {e}")
+                st.stop()
+
+            # ---------- debug: check mismatch between input and model expectation (non-fatal) ----------
+            model_expected = None
+            if hasattr(classifier, "feature_names_in_"):
+                model_expected = list(classifier.feature_names_in_)
+            else:
+                try:
+                    booster = classifier.get_booster()
+                    model_expected = booster.feature_names
+                except Exception:
+                    model_expected = None
+
+            if model_expected is not None:
+                set_expected = set(model_expected)
+                set_input = set(input_vector.columns)
+                extra = set_input - set_expected
+                missing = set_expected - set_input
+                if extra or missing:
+                    st.warning(
+                        "Feature name mismatch detected. Extra cols (not in model): "
+                        f"{list(sorted(extra))[:8]} ...; Missing cols (expected by model): {list(sorted(missing))[:8]} ..."
+                    )
+
+            # ---------- scale, predict and display ----------
+            try:
                 if scaler is not None:
                     input_scaled = scaler.transform(input_vector)
                 else:
-                    input_scaled = input_vector.values  # fallback
+                    input_scaled = input_vector.values
 
-                # Predict
                 eligibility_pred_raw = classifier.predict(input_scaled)[0]
-                # Probabilities (if available)
                 try:
                     eligibility_proba = classifier.predict_proba(input_scaled)[0]
                 except Exception:
-                    # classifier might not support predict_proba
                     eligibility_proba = None
-
                 max_emi_pred = regressor.predict(input_scaled)[0]
 
-                # Map prediction to label (use saved label encoder if available)
+                # map numeric labels via label encoder if present
                 pred_label = None
-                if isinstance(eligibility_pred_raw, (np.integer, int, np.ndarray)):
-                    # numeric label - try inverse transform
-                    le = None
-                    if isinstance(label_encoders, dict) and label_encoders.get("emi_eligibility") is not None:
-                        le = label_encoders.get("emi_eligibility")
-                    try:
-                        if le is not None:
-                            pred_label = le.inverse_transform([int(eligibility_pred_raw)])[0]
-                        else:
-                            # if classifier.classes_ are strings and indexable by numeric pred
-                            if hasattr(classifier, "classes_"):
-                                # If eligibility_pred_raw is index, map if needed
-                                if isinstance(eligibility_pred_raw, (np.integer, int)):
-                                    # If classes_ already correspond to encoded labels, attempt direct map
-                                    if 0 <= int(eligibility_pred_raw) < len(classifier.classes_):
-                                        pred_label = classifier.classes_[int(eligibility_pred_raw)]
-                                    else:
-                                        pred_label = str(eligibility_pred_raw)
-                                else:
-                                    pred_label = str(eligibility_pred_raw)
-                            else:
-                                pred_label = str(eligibility_pred_raw)
-                    except Exception:
+                try:
+                    if isinstance(eligibility_pred_raw, (int, np.integer)) and isinstance(label_encoders, dict) and label_encoders.get("emi_eligibility") is not None:
+                        pred_label = label_encoders["emi_eligibility"].inverse_transform([int(eligibility_pred_raw)])[0]
+                    else:
                         pred_label = str(eligibility_pred_raw)
-                else:
-                    # If classifier returned string label directly
+                except Exception:
                     pred_label = str(eligibility_pred_raw)
 
                 # Display results
