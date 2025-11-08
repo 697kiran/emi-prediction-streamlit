@@ -1,4 +1,4 @@
-# streamlit_app.py (resolved & updated)
+# streamlit_app.py (resolved & updated, with alignment debug)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -416,7 +416,8 @@ elif page == "EMI Prediction":
                 st.error(f"Error building feature vector: {e}")
                 st.stop()
 
-            # ---------- debug: check mismatch between input and model expectation (non-fatal) ----------
+            # --------- DIAGNOSTIC + ALIGNMENT (ensure input matches model exactly) ----------
+            # model_expected: what the classifier/XGBoost actually expects
             model_expected = None
             if hasattr(classifier, "feature_names_in_"):
                 model_expected = list(classifier.feature_names_in_)
@@ -427,16 +428,50 @@ elif page == "EMI Prediction":
                 except Exception:
                     model_expected = None
 
-            if model_expected is not None:
-                set_expected = set(model_expected)
-                set_input = set(input_vector.columns)
-                extra = set_input - set_expected
-                missing = set_expected - set_input
-                if extra or missing:
+            # show short diagnostics (first 25 items)
+            st.info("Diagnostic: comparing feature lists (first 25 shown for each).")
+            st.write("feature_columns.json (first 25):", feature_columns[:25] if feature_columns is not None else "None")
+            st.write("Model expected features (first 25):", (model_expected[:25] if model_expected is not None else "None"))
+            st.write("Current input_vector columns (first 25):", list(input_vector.columns)[:25])
+
+            # if model_expected exists and feature_columns differ, show difference (non-fatal)
+            if model_expected is not None and feature_columns is not None:
+                s_feat = set(feature_columns)
+                s_model = set(model_expected)
+                extra_in_feat = sorted(list(s_feat - s_model))[:12]
+                extra_in_model = sorted(list(s_model - s_feat))[:12]
+                if extra_in_feat or extra_in_model:
                     st.warning(
-                        "Feature name mismatch detected. Extra cols (not in model): "
-                        f"{list(sorted(extra))[:8]} ...; Missing cols (expected by model): {list(sorted(missing))[:8]} ..."
+                        "feature_columns.json and model's feature names differ.\n"
+                        f"Cols in feature_columns.json but not in model (sample): {extra_in_feat} ...\n"
+                        f"Cols in model but not in feature_columns.json (sample): {extra_in_model} ...\n\n"
+                        "If these are different you should regenerate `feature_columns.json` from training (X.columns.tolist())."
                     )
+                else:
+                    st.success("feature_columns.json matches model expected features (set equality).")
+
+            # Reindex input_vector to feature_columns (this will create missing columns with zeros and drop extras)
+            if feature_columns is not None:
+                input_vector = input_vector.reindex(columns=feature_columns, fill_value=0)
+            else:
+                # fallback: drop obvious raw categorical columns
+                raw_cats = ['age_group', 'education', 'employment_type', 'company_type',
+                            'house_type', 'emi_scenario', 'existing_loans', 'gender', 'emi_eligibility']
+                for c in raw_cats:
+                    if c in input_vector.columns:
+                        input_vector = input_vector.drop(columns=[c])
+
+            # Final check vs model_expected (stop if mismatch)
+            if model_expected is not None:
+                set_input = set(input_vector.columns)
+                set_model = set(model_expected)
+                missing_for_model = sorted(list(set_model - set_input))[:10]
+                extra_for_model = sorted(list(set_input - set_model))[:10]
+                if missing_for_model or extra_for_model:
+                    st.error(f"Post-alignment mismatch vs model: missing (sample) {missing_for_model} ; extra (sample) {extra_for_model}")
+                    st.stop()
+                else:
+                    st.success("Input columns now match the model expected features (set equality).")
 
             # ---------- scale, predict and display ----------
             try:
