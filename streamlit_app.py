@@ -1,4 +1,4 @@
-# streamlit_app.py (resolved & updated, with alignment debug)
+# streamlit_app.py (full file) - includes improved load_models()
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -109,54 +109,73 @@ def build_feature_vector(input_df: pd.DataFrame, feature_columns: list):
 
 
 # ------------------------
-# Robust model loading
+# Improved load_models: prefer model.feature_names_in_ if JSON looks stale
 # ------------------------
 @st.cache_resource
 def load_models(model_dir: str = "models"):
-    """
-    Loads classifier, regressor, scaler, label_encoders, and feature_columns.
-    Expects files:
-      - models/best_classifier.pkl
-      - models/best_regressor.pkl
-      - models/scaler.pkl
-      - models/label_encoders.pkl
-      - models/feature_columns.json
-    Returns tuple (classifier, regressor, scaler, label_encoders, feature_columns)
-    Missing artifacts are returned as None and a friendly error message is displayed.
-    """
     cls_path = os.path.join(model_dir, "best_classifier.pkl")
     reg_path = os.path.join(model_dir, "best_regressor.pkl")
     scaler_path = os.path.join(model_dir, "scaler.pkl")
     label_enc_path = os.path.join(model_dir, "label_encoders.pkl")
     feature_cols_path = os.path.join(model_dir, "feature_columns.json")
 
-    missing = []
-    for p in [cls_path, reg_path, scaler_path, label_enc_path, feature_cols_path]:
+    # required artifact presence check (allow missing feature_columns.json but require models)
+    for p in [cls_path, reg_path, scaler_path, label_enc_path]:
         if not os.path.exists(p):
-            missing.append(p)
+            return None, None, None, None, None
 
-    if missing:
-        # Do not raise — return Nones so app can show a readable message
-        return None, None, None, None, None
-
+    # load core artifacts
     try:
         classifier = joblib.load(cls_path)
         regressor = joblib.load(reg_path)
         scaler = joblib.load(scaler_path)
         label_encoders = joblib.load(label_enc_path)
-        with open(feature_cols_path, "r") as f:
-            feature_columns = json.load(f)
-        return classifier, regressor, scaler, label_encoders, feature_columns
     except Exception as e:
-        # If any loading step fails, return Nones (app will present an error)
         st.error(f"Model loading exception: {e}")
         return None, None, None, None, None
+
+    # load feature_columns.json if present
+    feature_columns = None
+    if os.path.exists(feature_cols_path):
+        try:
+            with open(feature_cols_path, "r") as f:
+                feature_columns = json.load(f)
+        except Exception:
+            feature_columns = None
+
+    # derive model_expected from classifier if possible
+    model_expected = None
+    try:
+        if hasattr(classifier, "feature_names_in_"):
+            model_expected = list(classifier.feature_names_in_)
+        else:
+            try:
+                booster = classifier.get_booster()
+                model_expected = booster.feature_names
+            except Exception:
+                model_expected = None
+    except Exception:
+        model_expected = None
+
+    # Heuristic: prefer model_expected if feature_columns looks stale (low overlap)
+    if model_expected is not None:
+        if feature_columns is None:
+            feature_columns = model_expected
+        else:
+            set_feat = set(feature_columns)
+            set_model = set(model_expected)
+            # if overlap is tiny, override feature_columns with model_expected
+            if len(set_feat & set_model) < max(1, len(set_model) // 10):
+                feature_columns = model_expected
+
+    # final return
+    return classifier, regressor, scaler, label_encoders, feature_columns
 
 
 classifier, regressor, scaler, label_encoders, feature_columns = load_models()
 
 # ------------------------
-# Sidebar and pages (fixed names without leading spaces)
+# Sidebar and pages
 # ------------------------
 st.sidebar.title("Navigation")
 page = st.sidebar.selectbox(
@@ -360,22 +379,14 @@ elif page == "EMI Prediction":
 
             # ---------- helper: set one-hot columns using feature_columns ----------
             def apply_one_hot(base_row_dict, feature_columns, mappings):
-                """
-                base_row_dict: numeric + binary values (dict)
-                feature_columns: list of training feature names (ordered)
-                mappings: dict of {prefix: value} e.g. {"education": "Graduate", "employment_type": "Private"}
-                Returns a 1-row DataFrame with exactly feature_columns columns.
-                """
                 fv = pd.DataFrame(columns=feature_columns)
                 fv.loc[0] = 0
-                # fill numeric/binary values that are present in feature_columns
                 for k, v in base_row_dict.items():
                     if k in fv.columns:
                         try:
                             fv.at[0, k] = float(v)
                         except Exception:
                             fv.at[0, k] = v
-                # For each mapping, set the matching one-hot column to 1 if it exists
                 for prefix, val in mappings.items():
                     candidates = [
                         f"{prefix}_{val}",
@@ -409,15 +420,14 @@ elif page == "EMI Prediction":
                 "income_category": income_cat_val,
             }
 
-            # build the final input vector DataFrame (exactly match feature_columns)
+            # build input vector
             try:
                 input_vector = apply_one_hot(base_dict, feature_columns, cat_mappings)
             except Exception as e:
                 st.error(f"Error building feature vector: {e}")
                 st.stop()
 
-            # --------- DIAGNOSTIC + ALIGNMENT (ensure input matches model exactly) ----------
-            # model_expected: what the classifier/XGBoost actually expects
+            # DIAGNOSTIC + ALIGNMENT
             model_expected = None
             if hasattr(classifier, "feature_names_in_"):
                 model_expected = list(classifier.feature_names_in_)
@@ -428,13 +438,11 @@ elif page == "EMI Prediction":
                 except Exception:
                     model_expected = None
 
-            # show short diagnostics (first 25 items)
             st.info("Diagnostic: comparing feature lists (first 25 shown for each).")
             st.write("feature_columns.json (first 25):", feature_columns[:25] if feature_columns is not None else "None")
             st.write("Model expected features (first 25):", (model_expected[:25] if model_expected is not None else "None"))
             st.write("Current input_vector columns (first 25):", list(input_vector.columns)[:25])
 
-            # if model_expected exists and feature_columns differ, show difference (non-fatal)
             if model_expected is not None and feature_columns is not None:
                 s_feat = set(feature_columns)
                 s_model = set(model_expected)
@@ -450,18 +458,16 @@ elif page == "EMI Prediction":
                 else:
                     st.success("feature_columns.json matches model expected features (set equality).")
 
-            # Reindex input_vector to feature_columns (this will create missing columns with zeros and drop extras)
+            # Reindex to canonical feature_columns (which load_models may have set to model_expected)
             if feature_columns is not None:
                 input_vector = input_vector.reindex(columns=feature_columns, fill_value=0)
             else:
-                # fallback: drop obvious raw categorical columns
                 raw_cats = ['age_group', 'education', 'employment_type', 'company_type',
                             'house_type', 'emi_scenario', 'existing_loans', 'gender', 'emi_eligibility']
                 for c in raw_cats:
                     if c in input_vector.columns:
                         input_vector = input_vector.drop(columns=[c])
 
-            # Final check vs model_expected (stop if mismatch)
             if model_expected is not None:
                 set_input = set(input_vector.columns)
                 set_model = set(model_expected)
