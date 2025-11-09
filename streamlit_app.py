@@ -1,5 +1,3 @@
-# streamlit_app.py (permanent fix: model-driven feature alignment + auto-update feature_columns.json)
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -13,7 +11,6 @@ warnings.filterwarnings("ignore")
 import plotly.express as px
 import plotly.graph_objects as go
 
-# mlflow is optional at runtime; guard import to avoid build failures if not present
 try:
     import mlflow
     import mlflow.sklearn
@@ -97,23 +94,20 @@ def build_feature_vector_from_base_and_model(base_dict: dict, cat_mappings: dict
             if prefix in fv.columns:
                 fv.at[0, prefix] = val_str
 
-    # Ensure numeric types, fill NaNs with 0
-    fv = fv.apply(pd.to_numeric, errors="ignore")
-    # For columns that are numeric-like strings we convert to numeric
+    # Ensure numeric types, fill NaNs with 0 where appropriate
     for c in fv.columns:
-        # keep as is if column is clearly categorical (has any non-numeric items)
+        # try convert if numeric-like
         try:
             fv[c] = pd.to_numeric(fv[c], errors="ignore")
         except Exception:
             pass
 
-    # Finally fill any remaining NaN numeric columns with 0
     fv = fv.where(pd.notnull(fv), 0)
     return fv
 
 
 # ------------------------
-# Robust load_models (permanent: model-driven features + write back JSON)
+# Robust load_models (permanent: model-driven features + XGBoost compatibility adjustments)
 # ------------------------
 @st.cache_resource
 def load_models(model_dir: str = "models"):
@@ -123,7 +117,7 @@ def load_models(model_dir: str = "models"):
     label_enc_path = os.path.join(model_dir, "label_encoders.pkl")
     feature_cols_path = os.path.join(model_dir, "feature_columns.json")
 
-    # check required artifacts
+    # required artifact presence check
     for p in [cls_path, reg_path, scaler_path, label_enc_path]:
         if not os.path.exists(p):
             return None, None, None, None, None
@@ -137,27 +131,23 @@ def load_models(model_dir: str = "models"):
         st.error(f"Model loading exception: {e}")
         return None, None, None, None, None
 
-    # === 🩹 XGBoost compatibility patch ===
+    # XGBoost compatibility patch: remove or set attributes that cause cross-version pickle errors
     try:
         if "xgb" in type(classifier).__name__.lower():
-            # remove stale attributes
             for bad_attr in ["use_label_encoder", "gpu_id", "tree_method", "n_gpus"]:
                 if hasattr(classifier, bad_attr):
                     try:
                         delattr(classifier, bad_attr)
                     except Exception:
                         pass
-
-            # add defaults if missing
             if not hasattr(classifier, "use_label_encoder"):
                 classifier.use_label_encoder = False
             if not hasattr(classifier, "eval_metric"):
                 classifier.eval_metric = "logloss"
     except Exception:
         pass
-    # ======================================
 
-    # load feature_columns.json
+    # load feature_columns.json if present
     feature_columns = None
     if os.path.exists(feature_cols_path):
         try:
@@ -166,7 +156,7 @@ def load_models(model_dir: str = "models"):
         except Exception:
             feature_columns = None
 
-    # derive features expected by model if available
+    # derive model_expected from classifier if possible
     model_expected = None
     try:
         if hasattr(classifier, "feature_names_in_"):
@@ -180,11 +170,14 @@ def load_models(model_dir: str = "models"):
     except Exception:
         model_expected = None
 
+    # Heuristic: prefer model_expected if JSON looks stale
     if model_expected is not None:
         if feature_columns is None:
             feature_columns = model_expected
         else:
-            if len(set(feature_columns) & set(model_expected)) < max(1, len(model_expected)//10):
+            set_feat = set(feature_columns)
+            set_model = set(model_expected)
+            if len(set_feat & set_model) < max(1, len(set_model) // 10):
                 feature_columns = model_expected
 
     return classifier, regressor, scaler, label_encoders, feature_columns
@@ -193,7 +186,7 @@ def load_models(model_dir: str = "models"):
 classifier, regressor, scaler, label_encoders, feature_columns = load_models()
 
 # ------------------------
-# Sidebar and pages
+# Sidebar + Header
 # ------------------------
 st.sidebar.title("Navigation")
 page = st.sidebar.selectbox(
@@ -201,9 +194,6 @@ page = st.sidebar.selectbox(
     ["Home", "EMI Prediction", "Data Analytics", "Model Performance", "Data Management"],
 )
 
-# ------------------------
-# Header
-# ------------------------
 st.markdown('<h1 class="main-header">EMIPredict AI</h1>', unsafe_allow_html=True)
 st.markdown('<p style="text-align: center; font-size: 1.2rem; color: #666;">Intelligent Financial Risk Assessment Platform</p>', unsafe_allow_html=True)
 
@@ -230,13 +220,13 @@ if page == "Home":
         st.markdown("- Data-driven loan amount recommendations\n- Portfolio risk management and default prediction")
 
 # ------------------------
-# EMI Prediction page (main logic uses model-driven canonical features)
+# EMI Prediction page
 # ------------------------
 elif page == "EMI Prediction":
     st.markdown("## EMI Eligibility & Amount Prediction")
 
-    if classifier is None or regressor is None or feature_columns is None:
-        st.error("Models or canonical feature list not loaded. Ensure 'models/' contains best_classifier.pkl, best_regressor.pkl, scaler.pkl and the app has permission to update feature_columns.json.")
+    if classifier is None or regressor is None or feature_columns is None or scaler is None:
+        st.error("Models or canonical feature list not loaded. Ensure 'models/' contains best_classifier.pkl, best_regressor.pkl, scaler.pkl, label_encoders.pkl and feature_columns.json.")
         st.stop()
 
     with st.form("prediction_form"):
@@ -320,7 +310,7 @@ elif page == "EMI Prediction":
             else:
                 income_cat_val = "Premium"
 
-            # Base numeric + binaries (these keys may or may not be used by model; build helper)
+            # Base numeric + binaries
             base_dict = {
                 "age": age,
                 "monthly_salary": monthly_salary,
@@ -346,7 +336,6 @@ elif page == "EMI Prediction":
                 "financial_stability_score": financial_stability_score,
                 "credit_utilization": credit_utilization,
                 "dependency_ratio": dependency_ratio,
-                # binary encodings if model expects them
                 "gender_encoded": 1 if gender == "Male" else 0,
                 "marital_status_encoded": 1 if marital_status == "Married" else 0,
                 "existing_loans_encoded": 1 if existing_loans == "Yes" else 0,
@@ -382,10 +371,7 @@ elif page == "EMI Prediction":
 
             # Scale and predict
             try:
-                if scaler is not None:
-                    input_scaled = scaler.transform(input_vector)
-                else:
-                    input_scaled = input_vector.values
+                input_scaled = scaler.transform(input_vector) if scaler is not None else input_vector.values
 
                 eligibility_pred_raw = classifier.predict(input_scaled)[0]
                 try:
@@ -443,7 +429,7 @@ elif page == "EMI Prediction":
                 st.error(f"Prediction error: {e}")
 
 # ------------------------
-# other pages (unchanged, static demos)
+# other pages (static demos)
 # ------------------------
 elif page == "Data Analytics":
     st.markdown("## Financial Data Analytics Dashboard")
@@ -475,5 +461,6 @@ elif page == "Data Management":
         st.success(f"Uploaded file with {df_new.shape[0]} records and {df_new.shape[1]} columns")
         st.dataframe(df_new.head(), use_container_width=True)
 
+# Footer
 st.markdown("---")
 st.markdown("<div style='text-align: center; color: #666; padding: 2rem;'><p> EMIPredict AI - Powered by Advanced Machine Learning</p><p>Built with Streamlit • MLflow (optional) • XGBoost • Random Forest</p></div>", unsafe_allow_html=True)
