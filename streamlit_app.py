@@ -117,19 +117,14 @@ def build_feature_vector_from_base_and_model(base_dict: dict, cat_mappings: dict
 # ------------------------
 @st.cache_resource
 def load_models(model_dir: str = "models"):
-    """
-    Loads classifier, regressor, scaler, label_encoders and canonical feature list.
-    If the classifier exposes feature names, we use that list as canonical and
-    overwrite models/feature_columns.json so the repo/cloud remains consistent.
-    """
     cls_path = os.path.join(model_dir, "best_classifier.pkl")
     reg_path = os.path.join(model_dir, "best_regressor.pkl")
     scaler_path = os.path.join(model_dir, "scaler.pkl")
     label_enc_path = os.path.join(model_dir, "label_encoders.pkl")
     feature_cols_path = os.path.join(model_dir, "feature_columns.json")
 
-    # require classifier and regressor and scaler at minimum
-    for p in [cls_path, reg_path, scaler_path]:
+    # require the main artifacts (feature_columns.json optional)
+    for p in [cls_path, reg_path, scaler_path, label_enc_path]:
         if not os.path.exists(p):
             return None, None, None, None, None
 
@@ -137,27 +132,45 @@ def load_models(model_dir: str = "models"):
         classifier = joblib.load(cls_path)
         regressor = joblib.load(reg_path)
         scaler = joblib.load(scaler_path)
-        label_encoders = joblib.load(label_enc_path) if os.path.exists(label_enc_path) else {}
+        label_encoders = joblib.load(label_enc_path)
     except Exception as e:
         st.error(f"Model loading exception: {e}")
         return None, None, None, None, None
 
+    # --- Compatibility fix for XGBoost sklearn wrapper ---
+    try:
+        # safe string check to avoid importing xgboost when not needed
+        cls_name = type(classifier).__name__.lower()
+        if "xgb" in cls_name or "xgboost" in cls_name:
+            # if the attribute is missing (newer xgboost removed it), set it for backward compatibility
+            if not hasattr(classifier, "use_label_encoder"):
+                classifier.use_label_encoder = False
+            # ensure eval_metric exists (some old saved objects relied on this attribute)
+            if not hasattr(classifier, "eval_metric"):
+                try:
+                    classifier.eval_metric = "logloss"
+                except Exception:
+                    pass
+    except Exception:
+        # never fail model loading because of this fix
+        pass
+    # ----------------------------------------------------
+
     # load feature_columns.json if present
-    feature_columns_json = None
+    feature_columns = None
     if os.path.exists(feature_cols_path):
         try:
             with open(feature_cols_path, "r") as f:
-                feature_columns_json = json.load(f)
+                feature_columns = json.load(f)
         except Exception:
-            feature_columns_json = None
+            feature_columns = None
 
-    # derive model_expected from classifier if possible
+    # derive features expected by model if available
     model_expected = None
     try:
         if hasattr(classifier, "feature_names_in_"):
             model_expected = list(classifier.feature_names_in_)
         else:
-            # XGBoost: get booster feature names if available
             try:
                 booster = classifier.get_booster()
                 model_expected = booster.feature_names
@@ -166,21 +179,17 @@ def load_models(model_dir: str = "models"):
     except Exception:
         model_expected = None
 
-    # If we have model_expected, use it as canonical feature list and persist to JSON (overwrite)
+    # prefer model_expected if JSON looks stale
     if model_expected is not None:
-        canonical = list(model_expected)
-        # attempt to write back to models/feature_columns.json to keep repo consistent
-        try:
-            os.makedirs(model_dir, exist_ok=True)
-            with open(feature_cols_path, "w") as f:
-                json.dump(canonical, f, indent=2)
-        except Exception:
-            # non-fatal if write fails (e.g., read-only FS) - we still use canonical in-memory
-            pass
-    else:
-        canonical = feature_columns_json  # may be None
+        if feature_columns is None:
+            feature_columns = model_expected
+        else:
+            set_feat = set(feature_columns)
+            set_model = set(model_expected)
+            if len(set_feat & set_model) < max(1, len(set_model) // 10):
+                feature_columns = model_expected
 
-    return classifier, regressor, scaler, label_encoders, canonical
+    return classifier, regressor, scaler, label_encoders, feature_columns
 
 
 classifier, regressor, scaler, label_encoders, feature_columns = load_models()
