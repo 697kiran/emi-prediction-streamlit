@@ -123,7 +123,7 @@ def load_models(model_dir: str = "models"):
     label_enc_path = os.path.join(model_dir, "label_encoders.pkl")
     feature_cols_path = os.path.join(model_dir, "feature_columns.json")
 
-    # require the main artifacts (feature_columns.json optional)
+    # check required artifacts
     for p in [cls_path, reg_path, scaler_path, label_enc_path]:
         if not os.path.exists(p):
             return None, None, None, None, None
@@ -137,26 +137,27 @@ def load_models(model_dir: str = "models"):
         st.error(f"Model loading exception: {e}")
         return None, None, None, None, None
 
-    # --- Compatibility fix for XGBoost sklearn wrapper ---
+    # === 🩹 XGBoost compatibility patch ===
     try:
-        # safe string check to avoid importing xgboost when not needed
-        cls_name = type(classifier).__name__.lower()
-        if "xgb" in cls_name or "xgboost" in cls_name:
-            # if the attribute is missing (newer xgboost removed it), set it for backward compatibility
+        if "xgb" in type(classifier).__name__.lower():
+            # remove stale attributes
+            for bad_attr in ["use_label_encoder", "gpu_id", "tree_method", "n_gpus"]:
+                if hasattr(classifier, bad_attr):
+                    try:
+                        delattr(classifier, bad_attr)
+                    except Exception:
+                        pass
+
+            # add defaults if missing
             if not hasattr(classifier, "use_label_encoder"):
                 classifier.use_label_encoder = False
-            # ensure eval_metric exists (some old saved objects relied on this attribute)
             if not hasattr(classifier, "eval_metric"):
-                try:
-                    classifier.eval_metric = "logloss"
-                except Exception:
-                    pass
+                classifier.eval_metric = "logloss"
     except Exception:
-        # never fail model loading because of this fix
         pass
-    # ----------------------------------------------------
+    # ======================================
 
-    # load feature_columns.json if present
+    # load feature_columns.json
     feature_columns = None
     if os.path.exists(feature_cols_path):
         try:
@@ -179,14 +180,11 @@ def load_models(model_dir: str = "models"):
     except Exception:
         model_expected = None
 
-    # prefer model_expected if JSON looks stale
     if model_expected is not None:
         if feature_columns is None:
             feature_columns = model_expected
         else:
-            set_feat = set(feature_columns)
-            set_model = set(model_expected)
-            if len(set_feat & set_model) < max(1, len(set_model) // 10):
+            if len(set(feature_columns) & set(model_expected)) < max(1, len(model_expected)//10):
                 feature_columns = model_expected
 
     return classifier, regressor, scaler, label_encoders, feature_columns
