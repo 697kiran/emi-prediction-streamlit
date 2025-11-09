@@ -1,4 +1,4 @@
-# streamlit_app.py (full file) - includes improved load_models()
+# streamlit_app.py (resolved & updated)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -74,7 +74,7 @@ st.markdown(
 )
 
 # ------------------------
-# Helpers: build feature vector + safe divisions
+# Helpers: safe division and collapse one-hots
 # ------------------------
 def safe_div(a, b, default=0.0):
     try:
@@ -85,25 +85,68 @@ def safe_div(a, b, default=0.0):
         return default
 
 
+def collapse_onehots_to_cats(input_df: pd.DataFrame, expected_features: list):
+    """
+    Convert one-hot columns like 'age_group_Young' into a single categorical column 'age_group'
+    *only* when the model expects a single column 'age_group' (i.e., 'age_group' is in expected_features).
+    The function returns a NEW dataframe (does not modify input_df).
+    """
+    df = input_df.copy()
+    expected_set = set(expected_features or [])
+
+    # Detect prefixes that have dummies present
+    # e.g., age_group_Young, age_group_Adult -> prefix 'age_group'
+    prefixes = set()
+    for col in df.columns:
+        if "_" in col:
+            prefix = col.split("_")[0]
+            # only if model expects prefix (single column) and dummy columns exist
+            if prefix in expected_set and any(c.startswith(prefix + "_") for c in df.columns):
+                prefixes.add(prefix)
+
+    for prefix in prefixes:
+        dummy_cols = [c for c in df.columns if c.startswith(prefix + "_")]
+        # Determine selected value (exact 1 preferred, else max)
+        selected = None
+        for c in dummy_cols:
+            try:
+                if float(df.at[0, c]) == 1:
+                    selected = c.replace(prefix + "_", "")
+                    break
+            except Exception:
+                continue
+        if selected is None:
+            try:
+                vals = df.loc[0, dummy_cols].astype(float)
+                max_idx = vals.idxmax()
+                if vals[max_idx] > 0:
+                    selected = max_idx.replace(prefix + "_", "")
+            except Exception:
+                selected = None
+
+        # set collapsed column (only if model expects it)
+        if prefix in expected_set:
+            df[prefix] = selected if selected is not None else "Unknown"
+
+        # drop the dummy cols to avoid mismatch
+        df = df.drop(columns=dummy_cols, errors='ignore')
+
+    return df
+
+
 def build_feature_vector(input_df: pd.DataFrame, feature_columns: list):
     """
-    Ensure the input_df (1-row) matches the exact columns used at training time.
+    Ensure the input_df (1-row) matches the exact columns used at training time (feature_columns).
     Missing columns are created and set to 0, extra columns are ignored.
-    Returns a single-row DataFrame with columns in exactly feature_columns order.
     """
     if feature_columns is None:
-        # If feature_columns not supplied, fall back to input_df itself
         return input_df.copy().reset_index(drop=True)
 
     fv = pd.DataFrame(columns=feature_columns)
-    fv.loc[0] = 0  # initialize to zeros
-
+    fv.loc[0] = 0
     for c in input_df.columns:
         if c in fv.columns:
-            # maintain numeric dtype where possible
             fv.at[0, c] = input_df.at[0, c]
-
-    # Ensure numeric types for scaler
     fv = fv.apply(pd.to_numeric, errors="coerce").fillna(0)
     return fv
 
@@ -119,12 +162,11 @@ def load_models(model_dir: str = "models"):
     label_enc_path = os.path.join(model_dir, "label_encoders.pkl")
     feature_cols_path = os.path.join(model_dir, "feature_columns.json")
 
-    # required artifact presence check (allow missing feature_columns.json but require models)
+    # require models/scaler/label_encoders; feature_columns optional (we'll derive from model if stale)
     for p in [cls_path, reg_path, scaler_path, label_enc_path]:
         if not os.path.exists(p):
             return None, None, None, None, None
 
-    # load core artifacts
     try:
         classifier = joblib.load(cls_path)
         regressor = joblib.load(reg_path)
@@ -134,7 +176,6 @@ def load_models(model_dir: str = "models"):
         st.error(f"Model loading exception: {e}")
         return None, None, None, None, None
 
-    # load feature_columns.json if present
     feature_columns = None
     if os.path.exists(feature_cols_path):
         try:
@@ -143,32 +184,29 @@ def load_models(model_dir: str = "models"):
         except Exception:
             feature_columns = None
 
-    # derive model_expected from classifier if possible
+    # derive model expected features
     model_expected = None
     try:
         if hasattr(classifier, "feature_names_in_"):
             model_expected = list(classifier.feature_names_in_)
         else:
             try:
-                booster = classifier.get_booster()
-                model_expected = booster.feature_names
+                model_expected = classifier.get_booster().feature_names
             except Exception:
                 model_expected = None
     except Exception:
         model_expected = None
 
-    # Heuristic: prefer model_expected if feature_columns looks stale (low overlap)
+    # If feature_columns appears stale (low overlap) prefer model_expected
     if model_expected is not None:
         if feature_columns is None:
             feature_columns = model_expected
         else:
             set_feat = set(feature_columns)
             set_model = set(model_expected)
-            # if overlap is tiny, override feature_columns with model_expected
             if len(set_feat & set_model) < max(1, len(set_model) // 10):
                 feature_columns = model_expected
 
-    # final return
     return classifier, regressor, scaler, label_encoders, feature_columns
 
 
@@ -377,16 +415,18 @@ elif page == "EMI Prediction":
                 "existing_loans_encoded": 1 if existing_loans == "Yes" else 0,
             }
 
-            # ---------- helper: set one-hot columns using feature_columns ----------
+            # ---------- build one-hot style features if feature_columns contains those names ----------
             def apply_one_hot(base_row_dict, feature_columns, mappings):
                 fv = pd.DataFrame(columns=feature_columns)
                 fv.loc[0] = 0
+                # fill numeric/binary
                 for k, v in base_row_dict.items():
                     if k in fv.columns:
                         try:
                             fv.at[0, k] = float(v)
                         except Exception:
                             fv.at[0, k] = v
+                # set one-hot candidates
                 for prefix, val in mappings.items():
                     candidates = [
                         f"{prefix}_{val}",
@@ -420,9 +460,21 @@ elif page == "EMI Prediction":
                 "income_category": income_cat_val,
             }
 
-            # build input vector
+            # build initial input_vector (may contain dummy one-hot columns OR not depending on feature_columns)
             try:
-                input_vector = apply_one_hot(base_dict, feature_columns, cat_mappings)
+                # If feature_columns is None, fallback to building a minimal numeric-only DF + simple binaries
+                if feature_columns is None:
+                    input_vector = pd.DataFrame([base_dict])
+                    # add simple categorical columns too
+                    input_vector["age_group"] = age_group_val
+                    input_vector["income_category"] = income_cat_val
+                    input_vector["education"] = education
+                    input_vector["employment_type"] = employment_type
+                    input_vector["company_type"] = company_type
+                    input_vector["house_type"] = house_type
+                    input_vector["emi_scenario"] = emi_scenario
+                else:
+                    input_vector = apply_one_hot(base_dict, feature_columns, cat_mappings)
             except Exception as e:
                 st.error(f"Error building feature vector: {e}")
                 st.stop()
@@ -443,31 +495,23 @@ elif page == "EMI Prediction":
             st.write("Model expected features (first 25):", (model_expected[:25] if model_expected is not None else "None"))
             st.write("Current input_vector columns (first 25):", list(input_vector.columns)[:25])
 
-            if model_expected is not None and feature_columns is not None:
-                s_feat = set(feature_columns)
-                s_model = set(model_expected)
-                extra_in_feat = sorted(list(s_feat - s_model))[:12]
-                extra_in_model = sorted(list(s_model - s_feat))[:12]
-                if extra_in_feat or extra_in_model:
-                    st.warning(
-                        "feature_columns.json and model's feature names differ.\n"
-                        f"Cols in feature_columns.json but not in model (sample): {extra_in_feat} ...\n"
-                        f"Cols in model but not in feature_columns.json (sample): {extra_in_model} ...\n\n"
-                        "If these are different you should regenerate `feature_columns.json` from training (X.columns.tolist())."
-                    )
-                else:
-                    st.success("feature_columns.json matches model expected features (set equality).")
+            # If model expects plain categorical col names (e.g., 'age_group') but our input has dummies,
+            # collapse the one-hot columns into a single categorical column before reindexing.
+            if model_expected is not None:
+                try:
+                    input_vector = collapse_onehots_to_cats(input_vector, model_expected)
+                except Exception as e:
+                    st.warning(f"Warning collapsing one-hot columns: {e}")
 
-            # Reindex to canonical feature_columns (which load_models may have set to model_expected)
-            if feature_columns is not None:
-                input_vector = input_vector.reindex(columns=feature_columns, fill_value=0)
+            # Reindex to canonical feature list: prefer feature_columns (loaded or derived), else model_expected
+            canonical_cols = feature_columns if feature_columns is not None else model_expected
+            if canonical_cols is not None:
+                input_vector = build_feature_vector(input_vector, canonical_cols)
             else:
-                raw_cats = ['age_group', 'education', 'employment_type', 'company_type',
-                            'house_type', 'emi_scenario', 'existing_loans', 'gender', 'emi_eligibility']
-                for c in raw_cats:
-                    if c in input_vector.columns:
-                        input_vector = input_vector.drop(columns=[c])
+                # final fallback: convert any remaining categorical raw columns into dummies with safe names
+                input_vector = input_vector.apply(pd.to_numeric, errors="coerce").fillna(0)
 
+            # Final diagnostic: compare to model_expected if available
             if model_expected is not None:
                 set_input = set(input_vector.columns)
                 set_model = set(model_expected)
