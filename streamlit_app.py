@@ -110,25 +110,34 @@ def build_input_vector(base_dict: dict, cat_mappings: dict, model_feature_names:
 # ------------------------
 # Robust load_models (permanent: model-driven features + XGBoost compatibility adjustments)
 # ------------------------
+# Replace your existing load_models with this function (drop-in)
 @st.cache_resource
 def load_models(model_dir: str = "models"):
+    """
+    Robust loader that wraps XGBoost models to avoid cross-version pickle errors.
+    Returns: classifier, regressor, scaler, label_encoders, feature_columns, message
+    """
     cls_path = os.path.join(model_dir, "best_classifier.pkl")
     reg_path = os.path.join(model_dir, "best_regressor.pkl")
     scaler_path = os.path.join(model_dir, "scaler.pkl")
     label_enc_path = os.path.join(model_dir, "label_encoders.pkl")
     feature_cols_path = os.path.join(model_dir, "feature_columns.json")
 
-    # required artifact presence check
-    # classifier & regressor are mandatory; scaler/label_encoders/feature json are expected
+    # required checks
     for p in [cls_path, reg_path]:
         if not os.path.exists(p):
             return None, None, None, None, None, f"Missing required artifact: {p}"
 
+    # load artifacts
     try:
-        classifier = joblib.load(cls_path)
+        classifier_raw = joblib.load(cls_path)
+    except Exception as e:
+        return None, None, None, None, None, f"Failed loading classifier: {e}"
+
+    try:
         regressor = joblib.load(reg_path)
     except Exception as e:
-        return None, None, None, None, None, f"Model loading exception: {e}"
+        return None, None, None, None, None, f"Failed loading regressor: {e}"
 
     scaler = None
     scaler_msg = None
@@ -156,21 +165,134 @@ def load_models(model_dir: str = "models"):
         except Exception:
             feature_columns = None
 
-    # derive model_expected from classifier if possible
+    # Helper wrapper around XGBoost models to avoid attribute errors across versions
+    class SafeXGBWrapper:
+        def __init__(self, model):
+            self.model = model
+            # Attempt to set safe defaults for common missing attrs
+            for attr, default in [
+                ("use_label_encoder", False),
+                ("gpu_id", None),
+                ("tree_method", None),
+                ("n_gpus", None),
+                ("eval_metric", "logloss"),
+            ]:
+                try:
+                    if not hasattr(self.model, attr):
+                        setattr(self.model, attr, default)
+                except Exception:
+                    # ignore if cannot set
+                    pass
+
+        def predict(self, X, **kwargs):
+            # Primary attempt: let sklearn wrapper handle it
+            try:
+                return self.model.predict(X, **kwargs)
+            except AttributeError as ae:
+                # if missing attribute raised, try to set common attrs then retry
+                missing = str(ae)
+                for attr in ["gpu_id", "use_label_encoder", "tree_method", "n_gpus"]:
+                    if not hasattr(self.model, attr):
+                        try:
+                            setattr(self.model, attr, None)
+                        except Exception:
+                            pass
+                # second attempt
+                try:
+                    return self.model.predict(X, **kwargs)
+                except Exception:
+                    # fallback: if underlying booster available, run booster.predict on DMatrix
+                    try:
+                        import xgboost as xgb
+                        booster = None
+                        try:
+                            booster = self.model.get_booster()
+                        except Exception:
+                            # if wrapped sklearn estimator stores .get_booster differently, try attribute
+                            booster = getattr(self.model, "booster_", None)
+                        if booster is not None:
+                            dmat = xgb.DMatrix(X)
+                            # For classifiers, booster.predict returns raw scores; this is a fallback
+                            return booster.predict(dmat)
+                    except Exception:
+                        pass
+                    # re-raise the original if nothing works
+                    raise
+
+        def predict_proba(self, X, **kwargs):
+            # Not all XGBoost wrappers implement predict_proba; try predict then transform if needed
+            try:
+                if hasattr(self.model, "predict_proba"):
+                    return self.model.predict_proba(X, **kwargs)
+                # else fallback to predict and try to shape into probabilities if multiclass
+                raw = self.predict(X, **kwargs)
+                # if raw already 2D (proba-like), return
+                arr = np.array(raw)
+                if arr.ndim == 2:
+                    return arr
+                # if 1D, try to convert via softmax for multiclass (unknown classes) or two-class mapping
+                # attempt safe softmax
+                try:
+                    if arr.ndim == 1:
+                        # if classifier was trained as binary and returns single score, map to two columns
+                        from scipy.special import softmax
+                        # attempt softmax over [ -arr, arr ] to produce 2-col probabilities
+                        two_col = np.vstack([ -arr, arr ]).T
+                        probs = softmax(two_col, axis=1)
+                        return probs
+                except Exception:
+                    pass
+                # otherwise return raw wrapped as 2D
+                return arr.reshape((arr.shape[0], -1))
+            except Exception:
+                # bubble up useful message
+                raise
+
+        @property
+        def classes_(self):
+            # expose classes_ if underlying model has them
+            return getattr(self.model, "classes_", None)
+
+    # If classifier looks like an XGBoost object (sklearn wrapper), wrap it
+    safe_classifier = classifier_raw
+    try:
+        tname = type(classifier_raw).__name__.lower()
+        if "xgb" in tname or "xgboost" in tname:
+            # Best-effort: set some defaults and wrap
+            try:
+                if not hasattr(classifier_raw, "use_label_encoder"):
+                    try:
+                        classifier_raw.use_label_encoder = False
+                    except Exception:
+                        pass
+                if not hasattr(classifier_raw, "eval_metric"):
+                    try:
+                        classifier_raw.eval_metric = "logloss"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            safe_classifier = SafeXGBWrapper(classifier_raw)
+    except Exception:
+        safe_classifier = classifier_raw
+
+    # model_expected features derivation (if needed)
     model_expected = None
     try:
-        if hasattr(classifier, "feature_names_in_"):
-            model_expected = list(classifier.feature_names_in_)
+        # if wrapped we still attempt to fetch from the original object
+        orig = getattr(classifier_raw, "model", classifier_raw)
+        if hasattr(orig, "feature_names_in_"):
+            model_expected = list(orig.feature_names_in_)
         else:
             try:
-                booster = classifier.get_booster()
+                booster = orig.get_booster()
                 model_expected = booster.feature_names
             except Exception:
                 model_expected = None
     except Exception:
         model_expected = None
 
-    # Heuristic: prefer model_expected if JSON looks stale
+    # choose canonical feature_columns
     if model_expected is not None:
         if feature_columns is None:
             feature_columns = model_expected
@@ -180,30 +302,12 @@ def load_models(model_dir: str = "models"):
             if len(set_feat & set_model) < max(1, len(set_model) // 10):
                 feature_columns = model_expected
 
-    # XGBoost compatibility patch: remove or set attributes that cause cross-version pickle errors
-    try:
-        if "xgb" in type(classifier).__name__.lower():
-            for bad_attr in ["use_label_encoder", "gpu_id", "tree_method", "n_gpus"]:
-                if hasattr(classifier, bad_attr):
-                    try:
-                        delattr(classifier, bad_attr)
-                    except Exception:
-                        pass
-            if not hasattr(classifier, "use_label_encoder"):
-                try:
-                    classifier.use_label_encoder = False
-                except Exception:
-                    pass
-            if not hasattr(classifier, "eval_metric"):
-                try:
-                    classifier.eval_metric = "logloss"
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
+    # compose return message (scaler load message if any)
     msg = scaler_msg
-    return classifier, regressor, scaler, label_encoders, feature_columns, msg
+
+    # Return the safe wrapper (so app uses safe_classifier), regressor, scaler, label_encoders, feature_columns, msg
+    return safe_classifier, regressor, scaler, label_encoders, feature_columns, msg
+
 
 
 classifier, regressor, scaler, label_encoders, feature_columns, load_msg = load_models()
