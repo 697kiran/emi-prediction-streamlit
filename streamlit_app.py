@@ -108,12 +108,15 @@ def build_input_vector(base_dict: dict, cat_mappings: dict, model_feature_names:
 
 
 # ------------------------
+# ------------------------
+# Robust load_models (XGBoost-safe wrapper) - replacement (returns 6 values)
+# ------------------------
 @st.cache_resource
 def load_models(model_dir: str = "models"):
     """
     Load artifacts and wrap XGBoost classifier in a SafeXGBWrapper to avoid
-    cross-version pickle attribute errors (gpu_id, predictor, use_label_encoder, etc).
-    Returns (classifier, regressor, scaler, label_encoders, feature_columns)
+    cross-version pickle attribute errors. Returns:
+      (classifier, regressor, scaler, label_encoders, feature_columns, load_msg)
     """
     cls_path = os.path.join(model_dir, "best_classifier.pkl")
     reg_path = os.path.join(model_dir, "best_regressor.pkl")
@@ -121,28 +124,33 @@ def load_models(model_dir: str = "models"):
     label_enc_path = os.path.join(model_dir, "label_encoders.pkl")
     feature_cols_path = os.path.join(model_dir, "feature_columns.json")
 
-    # Required model files
-    for req in [cls_path, reg_path]:
-        if not os.path.exists(req):
-            return None, None, None, None, None
+    # Required model files (classifier and regressor must exist)
+    missing_reqs = [p for p in (cls_path, reg_path) if not os.path.exists(p)]
+    if missing_reqs:
+        msg = f"Missing required artifact(s): {', '.join(os.path.basename(p) for p in missing_reqs)}"
+        return None, None, None, None, None, msg
 
-    # Load core artifacts (fail-safe)
+    # Load artifacts with safe fallbacks
     try:
         classifier_raw = joblib.load(cls_path)
-    except Exception:
-        return None, None, None, None, None
+    except Exception as e:
+        return None, None, None, None, None, f"Failed loading classifier: {e}"
 
     try:
         regressor = joblib.load(reg_path)
-    except Exception:
-        return None, None, None, None, None
+    except Exception as e:
+        return None, None, None, None, None, f"Failed loading regressor: {e}"
 
     scaler = None
+    scaler_msg = None
     if os.path.exists(scaler_path):
         try:
             scaler = joblib.load(scaler_path)
-        except Exception:
+        except Exception as e:
             scaler = None
+            scaler_msg = f"Failed loading scaler.pkl: {e}"
+    else:
+        scaler_msg = "scaler.pkl not found"
 
     label_encoders = None
     if os.path.exists(label_enc_path):
@@ -159,18 +167,18 @@ def load_models(model_dir: str = "models"):
         except Exception:
             feature_columns = None
 
-    # Safe wrapper for XGBoost-like models ------------------------------------------------
+    # --- Safe wrapper for XGBoost-like pickles ---
     class SafeXGBWrapper:
         def __init__(self, model):
             self._model = model
-            # Add safe defaults for frequently-missing attributes
+            # Ensure some common attributes exist so attribute access doesn't blow up
             for attr, default in [
                 ("use_label_encoder", False),
                 ("gpu_id", None),
                 ("tree_method", None),
                 ("n_gpus", None),
                 ("eval_metric", "logloss"),
-                ("predictor", None),  # often missing across versions
+                ("predictor", None),
             ]:
                 try:
                     if not hasattr(self._model, attr):
@@ -179,17 +187,16 @@ def load_models(model_dir: str = "models"):
                     pass
 
         def __getattr__(self, name):
-            # forward everything else to underlying model where possible
-            if name in ("_model", "predict", "predict_proba"):
+            if name in ("_model",):
                 return object.__getattribute__(self, name)
             return getattr(self._model, name)
 
         def predict(self, X, **kwargs):
-            # Try normal sklearn-wrapper predict first
+            # Try wrapper predict -> fallback to booster.predict(DMatrix)
             try:
                 return self._model.predict(X, **kwargs)
-            except Exception as e:
-                # Try to populate common missing attrs then retry once
+            except Exception:
+                # try safely adding missing attrs then retry
                 for attr in ("gpu_id", "use_label_encoder", "tree_method", "n_gpus", "predictor"):
                     if not hasattr(self._model, attr):
                         try:
@@ -199,11 +206,9 @@ def load_models(model_dir: str = "models"):
                 try:
                     return self._model.predict(X, **kwargs)
                 except Exception:
-                    # Fallback: if booster available, use raw booster prediction (DMatrix)
                     try:
                         import xgboost as xgb
                         booster = None
-                        # try multiple ways to get booster
                         try:
                             booster = self._model.get_booster()
                         except Exception:
@@ -213,43 +218,39 @@ def load_models(model_dir: str = "models"):
                             return booster.predict(dmat)
                     except Exception:
                         pass
-                    # re-raise original error if nothing worked
+                    # re-raise the original error if nothing worked
                     raise
 
         def predict_proba(self, X, **kwargs):
-            # Prefer model.predict_proba if available
+            # Prefer wrapper predict_proba; if unavailable, approximate
             try:
                 if hasattr(self._model, "predict_proba"):
                     return self._model.predict_proba(X, **kwargs)
             except Exception:
                 pass
-
-            # Fallback: try predict + softmax/reshape heuristics
+            # fallback to predict + convert
+            raw = self.predict(X, **kwargs)
+            arr = np.array(raw)
+            if arr.ndim == 2:
+                return arr
+            # binary fallback -> two-column probability using softmax-like
             try:
-                raw = self.predict(X, **kwargs)
-                arr = np.array(raw)
-                if arr.ndim == 2:
-                    return arr
-                # If 1D, attempt binary conversion -> two columns via logistic/softmax like mapping
-                try:
-                    from scipy.special import softmax
-                    two_col = np.vstack([-arr, arr]).T
-                    return softmax(two_col, axis=1)
-                except Exception:
-                    return arr.reshape((arr.shape[0], -1))
+                from scipy.special import softmax
+                two_col = np.vstack([-arr, arr]).T
+                return softmax(two_col, axis=1)
             except Exception:
-                raise
+                return arr.reshape((arr.shape[0], -1))
 
         @property
         def classes_(self):
             return getattr(self._model, "classes_", None)
 
-    # If classifier looks like an XGBoost estimator, wrap it
+    # Wrap if the classifier looks like XGBoost (name heuristic)
     safe_classifier = classifier_raw
     try:
         tname = type(classifier_raw).__name__.lower()
         if "xgb" in tname or "xgboost" in tname:
-            # add a couple of compat defaults on raw object if possible
+            # add a couple of defaults directly first (best-effort)
             try:
                 if not hasattr(classifier_raw, "use_label_encoder"):
                     classifier_raw.use_label_encoder = False
@@ -260,9 +261,8 @@ def load_models(model_dir: str = "models"):
             safe_classifier = SafeXGBWrapper(classifier_raw)
     except Exception:
         safe_classifier = classifier_raw
-    # -------------------------------------------------------------------------------------
 
-    # Derive model_expected feature names (prefer classifier metadata when JSON might be stale)
+    # Derive model_expected from classifier/booster when possible
     model_expected = None
     try:
         orig = getattr(classifier_raw, "_model", classifier_raw)
@@ -277,7 +277,7 @@ def load_models(model_dir: str = "models"):
     except Exception:
         model_expected = None
 
-    # If model_expected exists and JSON missing or very mismatched, prefer model_expected
+    # If JSON missing or very mismatched, prefer model_expected
     if model_expected is not None:
         if feature_columns is None:
             feature_columns = model_expected
@@ -287,7 +287,18 @@ def load_models(model_dir: str = "models"):
             if len(set_feat & set_model) < max(1, len(set_model)//10):
                 feature_columns = model_expected
 
-    return safe_classifier, regressor, scaler, label_encoders, feature_columns
+    # Construct load message
+    msgs = []
+    if scaler_msg:
+        msgs.append(scaler_msg)
+    if feature_columns is None:
+        msgs.append("feature_columns.json missing or unreadable; using model feature names if available.")
+    if model_expected is not None:
+        msgs.append(f"Using model-derived feature list ({len(model_expected)} features).")
+    load_msg = " | ".join(msgs) if msgs else "Models loaded successfully."
+
+    return safe_classifier, regressor, scaler, label_encoders, feature_columns, load_msg
+
 
 classifier, regressor, scaler, label_encoders, feature_columns, load_msg = load_models()
 
