@@ -108,14 +108,12 @@ def build_input_vector(base_dict: dict, cat_mappings: dict, model_feature_names:
 
 
 # ------------------------
-# Robust load_models (permanent: model-driven features + XGBoost compatibility adjustments)
-# ------------------------
-# Replace your existing load_models with this function (drop-in)
 @st.cache_resource
 def load_models(model_dir: str = "models"):
     """
-    Robust loader that wraps XGBoost models to avoid cross-version pickle errors.
-    Returns: classifier, regressor, scaler, label_encoders, feature_columns, message
+    Load artifacts and wrap XGBoost classifier in a SafeXGBWrapper to avoid
+    cross-version pickle attribute errors (gpu_id, predictor, use_label_encoder, etc).
+    Returns (classifier, regressor, scaler, label_encoders, feature_columns)
     """
     cls_path = os.path.join(model_dir, "best_classifier.pkl")
     reg_path = os.path.join(model_dir, "best_regressor.pkl")
@@ -123,32 +121,28 @@ def load_models(model_dir: str = "models"):
     label_enc_path = os.path.join(model_dir, "label_encoders.pkl")
     feature_cols_path = os.path.join(model_dir, "feature_columns.json")
 
-    # required checks
-    for p in [cls_path, reg_path]:
-        if not os.path.exists(p):
-            return None, None, None, None, None, f"Missing required artifact: {p}"
+    # Required model files
+    for req in [cls_path, reg_path]:
+        if not os.path.exists(req):
+            return None, None, None, None, None
 
-    # load artifacts
+    # Load core artifacts (fail-safe)
     try:
         classifier_raw = joblib.load(cls_path)
-    except Exception as e:
-        return None, None, None, None, None, f"Failed loading classifier: {e}"
+    except Exception:
+        return None, None, None, None, None
 
     try:
         regressor = joblib.load(reg_path)
-    except Exception as e:
-        return None, None, None, None, None, f"Failed loading regressor: {e}"
+    except Exception:
+        return None, None, None, None, None
 
     scaler = None
-    scaler_msg = None
     if os.path.exists(scaler_path):
         try:
             scaler = joblib.load(scaler_path)
-        except Exception as e:
+        except Exception:
             scaler = None
-            scaler_msg = f"Failed loading scaler.pkl: {e}"
-    else:
-        scaler_msg = "scaler.pkl not found"
 
     label_encoders = None
     if os.path.exists(label_enc_path):
@@ -165,122 +159,113 @@ def load_models(model_dir: str = "models"):
         except Exception:
             feature_columns = None
 
-    # Helper wrapper around XGBoost models to avoid attribute errors across versions
+    # Safe wrapper for XGBoost-like models ------------------------------------------------
     class SafeXGBWrapper:
         def __init__(self, model):
-            self.model = model
-            # Attempt to set safe defaults for common missing attrs
+            self._model = model
+            # Add safe defaults for frequently-missing attributes
             for attr, default in [
                 ("use_label_encoder", False),
                 ("gpu_id", None),
                 ("tree_method", None),
                 ("n_gpus", None),
                 ("eval_metric", "logloss"),
+                ("predictor", None),  # often missing across versions
             ]:
                 try:
-                    if not hasattr(self.model, attr):
-                        setattr(self.model, attr, default)
+                    if not hasattr(self._model, attr):
+                        setattr(self._model, attr, default)
                 except Exception:
-                    # ignore if cannot set
                     pass
 
+        def __getattr__(self, name):
+            # forward everything else to underlying model where possible
+            if name in ("_model", "predict", "predict_proba"):
+                return object.__getattribute__(self, name)
+            return getattr(self._model, name)
+
         def predict(self, X, **kwargs):
-            # Primary attempt: let sklearn wrapper handle it
+            # Try normal sklearn-wrapper predict first
             try:
-                return self.model.predict(X, **kwargs)
-            except AttributeError as ae:
-                # if missing attribute raised, try to set common attrs then retry
-                missing = str(ae)
-                for attr in ["gpu_id", "use_label_encoder", "tree_method", "n_gpus"]:
-                    if not hasattr(self.model, attr):
+                return self._model.predict(X, **kwargs)
+            except Exception as e:
+                # Try to populate common missing attrs then retry once
+                for attr in ("gpu_id", "use_label_encoder", "tree_method", "n_gpus", "predictor"):
+                    if not hasattr(self._model, attr):
                         try:
-                            setattr(self.model, attr, None)
+                            setattr(self._model, attr, None)
                         except Exception:
                             pass
-                # second attempt
                 try:
-                    return self.model.predict(X, **kwargs)
+                    return self._model.predict(X, **kwargs)
                 except Exception:
-                    # fallback: if underlying booster available, run booster.predict on DMatrix
+                    # Fallback: if booster available, use raw booster prediction (DMatrix)
                     try:
                         import xgboost as xgb
                         booster = None
+                        # try multiple ways to get booster
                         try:
-                            booster = self.model.get_booster()
+                            booster = self._model.get_booster()
                         except Exception:
-                            # if wrapped sklearn estimator stores .get_booster differently, try attribute
-                            booster = getattr(self.model, "booster_", None)
+                            booster = getattr(self._model, "booster_", None)
                         if booster is not None:
                             dmat = xgb.DMatrix(X)
-                            # For classifiers, booster.predict returns raw scores; this is a fallback
                             return booster.predict(dmat)
                     except Exception:
                         pass
-                    # re-raise the original if nothing works
+                    # re-raise original error if nothing worked
                     raise
 
         def predict_proba(self, X, **kwargs):
-            # Not all XGBoost wrappers implement predict_proba; try predict then transform if needed
+            # Prefer model.predict_proba if available
             try:
-                if hasattr(self.model, "predict_proba"):
-                    return self.model.predict_proba(X, **kwargs)
-                # else fallback to predict and try to shape into probabilities if multiclass
+                if hasattr(self._model, "predict_proba"):
+                    return self._model.predict_proba(X, **kwargs)
+            except Exception:
+                pass
+
+            # Fallback: try predict + softmax/reshape heuristics
+            try:
                 raw = self.predict(X, **kwargs)
-                # if raw already 2D (proba-like), return
                 arr = np.array(raw)
                 if arr.ndim == 2:
                     return arr
-                # if 1D, try to convert via softmax for multiclass (unknown classes) or two-class mapping
-                # attempt safe softmax
+                # If 1D, attempt binary conversion -> two columns via logistic/softmax like mapping
                 try:
-                    if arr.ndim == 1:
-                        # if classifier was trained as binary and returns single score, map to two columns
-                        from scipy.special import softmax
-                        # attempt softmax over [ -arr, arr ] to produce 2-col probabilities
-                        two_col = np.vstack([ -arr, arr ]).T
-                        probs = softmax(two_col, axis=1)
-                        return probs
+                    from scipy.special import softmax
+                    two_col = np.vstack([-arr, arr]).T
+                    return softmax(two_col, axis=1)
                 except Exception:
-                    pass
-                # otherwise return raw wrapped as 2D
-                return arr.reshape((arr.shape[0], -1))
+                    return arr.reshape((arr.shape[0], -1))
             except Exception:
-                # bubble up useful message
                 raise
 
         @property
         def classes_(self):
-            # expose classes_ if underlying model has them
-            return getattr(self.model, "classes_", None)
+            return getattr(self._model, "classes_", None)
 
-    # If classifier looks like an XGBoost object (sklearn wrapper), wrap it
+    # If classifier looks like an XGBoost estimator, wrap it
     safe_classifier = classifier_raw
     try:
         tname = type(classifier_raw).__name__.lower()
         if "xgb" in tname or "xgboost" in tname:
-            # Best-effort: set some defaults and wrap
+            # add a couple of compat defaults on raw object if possible
             try:
                 if not hasattr(classifier_raw, "use_label_encoder"):
-                    try:
-                        classifier_raw.use_label_encoder = False
-                    except Exception:
-                        pass
+                    classifier_raw.use_label_encoder = False
                 if not hasattr(classifier_raw, "eval_metric"):
-                    try:
-                        classifier_raw.eval_metric = "logloss"
-                    except Exception:
-                        pass
+                    classifier_raw.eval_metric = "logloss"
             except Exception:
                 pass
             safe_classifier = SafeXGBWrapper(classifier_raw)
     except Exception:
         safe_classifier = classifier_raw
+    # -------------------------------------------------------------------------------------
 
-    # model_expected features derivation (if needed)
+    # Derive model_expected feature names (prefer classifier metadata when JSON might be stale)
     model_expected = None
     try:
-        # if wrapped we still attempt to fetch from the original object
-        orig = getattr(classifier_raw, "model", classifier_raw)
+        orig = getattr(classifier_raw, "_model", classifier_raw)
         if hasattr(orig, "feature_names_in_"):
             model_expected = list(orig.feature_names_in_)
         else:
@@ -292,23 +277,17 @@ def load_models(model_dir: str = "models"):
     except Exception:
         model_expected = None
 
-    # choose canonical feature_columns
+    # If model_expected exists and JSON missing or very mismatched, prefer model_expected
     if model_expected is not None:
         if feature_columns is None:
             feature_columns = model_expected
         else:
             set_feat = set(feature_columns)
             set_model = set(model_expected)
-            if len(set_feat & set_model) < max(1, len(set_model) // 10):
+            if len(set_feat & set_model) < max(1, len(set_model)//10):
                 feature_columns = model_expected
 
-    # compose return message (scaler load message if any)
-    msg = scaler_msg
-
-    # Return the safe wrapper (so app uses safe_classifier), regressor, scaler, label_encoders, feature_columns, msg
-    return safe_classifier, regressor, scaler, label_encoders, feature_columns, msg
-
-
+    return safe_classifier, regressor, scaler, label_encoders, feature_columns
 
 classifier, regressor, scaler, label_encoders, feature_columns, load_msg = load_models()
 
